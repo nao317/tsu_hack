@@ -4,7 +4,7 @@
 
 1. [アーキテクチャ概要](#1-アーキテクチャ概要)
 2. [リポジトリ構成](#2-リポジトリ構成)
-3. [データベース設計](#3-データベース設計postgresql)
+3. [データベース設計](#3-データベース設計mysql)
 4. [API 設計](#4-api-設計go--gin)
 5. [ディレクトリ構成](#5-ディレクトリ構成)
 6. [ローカル開発環境](#6-ローカル開発環境)
@@ -21,24 +21,30 @@
 |---|---|---|
 | Frontend | Next.js `localhost:3000`（通常サーバー） | Vercel（無料・SSR 完全対応） |
 | Backend | Go / Gin `localhost:8080`（Docker） | Render（Docker コンテナ・$7/月〜） |
-| Database | PostgreSQL（Docker）`:5432` | Supabase PostgreSQL（無料枠 500MB） |
-| 画像 | Go ローカルディスク `/uploads/` | Supabase Storage（無料枠 1GB） |
+| Database | MySQL 8.0（Docker）`:3306` | Render MySQL アドオン |
+| 画像ストレージ | Supabase Storage（クラウド・両 Phase 共通） | Supabase Storage（同左） |
 | 認証 | Go 自前 JWT | Go 自前 JWT（変更なし） |
 | AI | Gemini 2.5 Flash API | Gemini 2.5 Flash API（変更なし） |
-| メール確認 | Mailpit（Docker） | Supabase Auth メール or SendGrid |
+| メール確認 | Mailpit（Docker） | SendGrid 等 |
+
+> **Supabase は Storage のみ使用**
+> DB 機能（PostgreSQL）は使用しない。
+> `SUPABASE_URL` と `SUPABASE_SERVICE_KEY` があれば DB と無関係に Storage だけ利用できる。
+> Phase 1・Phase 2 で同じ Supabase プロジェクトを使い回す。
 
 ### 1.2 Phase 構成
 
 ```
 Phase 1: ローカル開発（アプリケーションを完成させる）
   - Next.js は npm run dev で通常起動
-  - PostgreSQL + Go は Docker で起動
-  - メール確認は Mailpit（Docker）
+  - MySQL + Go + Mailpit は Docker で起動
+  - Supabase Storage はクラウドにそのまま接続
 
 Phase 2: 本番リリース
   - Vercel（Frontend）
   - Render（Backend・Docker コンテナ）
-  - Supabase（PostgreSQL + Storage）
+  - Render MySQL アドオン（DB）
+  - Supabase Storage（画像・変更なし）
 ```
 
 ### 1.3 ユーザー種別と権限
@@ -51,13 +57,31 @@ Phase 2: 本番リリース
 > **ゲストユーザーの状態管理**
 > 選択カードや一時的なボード状態はフロントエンドの **Zustand**（メモリ）で管理する。
 > Next.js App Router 環境では `"use client"` コンポーネント内でのみ Zustand を使用する。
-> 今回のボード画面はインタラクティブ操作が中心のため Client Components がほとんどになり、Zustand は適切な選択。
+> ボード画面はインタラクティブ操作が中心のため Client Components がほとんどになり、Zustand は適切な選択。
 > DB への読み書きは行わない。
 
-### 1.4 Phase 移行の設計方針
+### 1.4 画像アップロードのフロー（案A）
+
+カード作成と画像アップロードを **1リクエストで完結** させる。
+画像だけ上がってカード未作成という中途半端な状態が残らない。
+
+```
+① フロントが multipart/form-data で POST /user/cards を送信
+       { file: <画像バイナリ>, label: "おにぎり", category: "食べ物", ... }
+            ↓
+② Go がリクエストから画像を取り出し Supabase Storage にアップロード
+            ↓
+③ Supabase Storage から公開 URL を取得
+            ↓
+④ label・category・image_url 等を MySQL の cards テーブルに INSERT
+            ↓
+⑤ 作成したカード情報（image_url 含む）をフロントに返す
+```
+
+### 1.5 Phase 移行の設計方針
 
 `storage.ImageStorage` インターフェースで抽象化することで、
-Phase 1 → 2 の移行は実装の差し替えと環境変数の変更のみで完結する。
+将来的なストレージ先の変更も実装の差し替えのみで完結する。
 
 ```go
 // backend/internal/storage/storage.go
@@ -67,16 +91,15 @@ type ImageStorage interface {
     GetPublicURL(key string) string
 }
 
-// Phase 1: LocalStorage 実装（/uploads/ に保存・http.FileServer で配信）
-// Phase 2: SupabaseStorage 実装（Supabase Storage SDK）
-// 環境変数 STORAGE_BACKEND=local | supabase で切り替え
+// 現在の実装: SupabaseStorage（Phase 1・2 共通）
+// 環境変数 STORAGE_BACKEND=supabase で指定
 ```
 
 ---
 
 ## 2. リポジトリ構成
 
-Git サブモジュール構成を採用する。ルートリポジトリ配下に backend・frontend を別リポジトリとして管理する。
+Git サブモジュール構成を採用する。
 
 ```
 tsu_hack/                  # ルートリポジトリ（サブモジュール管理）
@@ -91,19 +114,16 @@ tsu_hack/                  # ルートリポジトリ（サブモジュール管
 tsu_hackB/
 ├── cmd/
 ├── internal/
-├── migrations/
-├── supabase/              # Supabase CLIマイグレーション・シードをここに集約
-│   ├── config.toml
-│   ├── migrations/
-│   └── seed.sql
+├── migrations/            # MySQL マイグレーション SQL
 ├── Dockerfile
+├── docker-compose.yml     # MySQL + Go + Mailpit（ローカル開発用）
 ├── go.mod
 └── .env.example
 ```
 
-> **supabase/ の配置について**
-> マイグレーション実行は Go サーバーの起動と紐づくため、
-> DB スキーマ管理とバックエンドを同じリポジトリ（tsu_hackB）で管理するのが一貫性があり適切。
+> **Supabase の設定について**
+> Supabase は Storage のみ使用するため、専用ディレクトリは不要。
+> 接続情報は環境変数（`SUPABASE_URL` / `SUPABASE_SERVICE_KEY`）で管理する。
 
 ### tsu_hackF（フロントエンド）
 
@@ -118,7 +138,7 @@ tsu_hackF/
 
 ---
 
-## 3. データベース設計（PostgreSQL）
+## 3. データベース設計（MySQL）
 
 ### 3.1 テーブル一覧
 
@@ -142,113 +162,134 @@ tsu_hackF/
 
 ```sql
 CREATE TABLE users (
-  id            UUID         NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-  email         VARCHAR(255) NOT NULL UNIQUE,
-  password_hash VARCHAR(255) NOT NULL,
-  display_name  VARCHAR(100) NOT NULL,
-  created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-  updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
+  id            CHAR(36)     NOT NULL DEFAULT (UUID()) COMMENT 'ユーザーID',
+  email         VARCHAR(255) NOT NULL                  COMMENT 'メールアドレス',
+  password_hash VARCHAR(255) NOT NULL                  COMMENT 'bcrypt ハッシュ',
+  display_name  VARCHAR(100) NOT NULL                  COMMENT '表示名',
+  created_at    DATETIME     NOT NULL DEFAULT NOW()    COMMENT '登録日時',
+  updated_at    DATETIME     NOT NULL DEFAULT NOW()    COMMENT '更新日時',
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_users_email (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 #### ② locations（共有ロケーションマスター）
 
 ```sql
 CREATE TABLE locations (
-  id          UUID             NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-  name        VARCHAR(100)     NOT NULL,            -- 例: コンビニ
-  description TEXT,
-  latitude    DOUBLE PRECISION,                     -- 基準緯度（距離判定用）
-  longitude   DOUBLE PRECISION,                     -- 基準経度
-  radius_m    INTEGER          NOT NULL DEFAULT 200, -- 判定半径（メートル）
-  is_default  BOOLEAN          NOT NULL DEFAULT true,
-  created_at  TIMESTAMPTZ      NOT NULL DEFAULT NOW()
-);
+  id          CHAR(36)     NOT NULL DEFAULT (UUID())  COMMENT 'ロケーションID',
+  name        VARCHAR(100) NOT NULL                   COMMENT 'ロケーション名（例: コンビニ）',
+  description TEXT                                    COMMENT '説明文',
+  latitude    DOUBLE                                  COMMENT '基準緯度（距離判定用）',
+  longitude   DOUBLE                                  COMMENT '基準経度（距離判定用）',
+  radius_m    INT          NOT NULL DEFAULT 200       COMMENT '判定半径（メートル）',
+  is_default  TINYINT(1)   NOT NULL DEFAULT 1         COMMENT 'デフォルトフラグ',
+  created_at  DATETIME     NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 初期シードデータ
-INSERT INTO locations (name, radius_m) VALUES
-  ('コンビニ', 100),
-  ('病院',     200),
-  ('カフェ',   100);
+INSERT INTO locations (id, name, radius_m) VALUES
+  (UUID(), 'コンビニ', 100),
+  (UUID(), '病院',     200),
+  (UUID(), 'カフェ',   100);
 ```
 
 #### ③ cards（カードマスター）
 
+`image_url` カラムに Supabase Storage の公開 URL が保存される。
+
 ```sql
 CREATE TABLE cards (
-  id         UUID         NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-  label      VARCHAR(100) NOT NULL,            -- 表示テキスト（例: おにぎり）
-  image_url  TEXT,                             -- 画像URL（Supabase Storage or ローカル）
-  emoji      VARCHAR(10),                      -- image_url がない場合の絵文字
-  category   VARCHAR(50),                      -- 日常 / 食べ物 / 動詞 など
-  is_daily   BOOLEAN      NOT NULL DEFAULT false, -- 日常カードフラグ
-  created_by UUID         REFERENCES users(id) ON DELETE SET NULL, -- NULL はシステム共有
-  created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
+  id         CHAR(36)     NOT NULL DEFAULT (UUID())   COMMENT 'カードID',
+  label      VARCHAR(100) NOT NULL                    COMMENT '表示テキスト（例: おにぎり）',
+  image_url  TEXT                                     COMMENT 'Supabase Storage 公開URL',
+  emoji      VARCHAR(10)                              COMMENT '絵文字（image_url がない場合）',
+  category   VARCHAR(50)                              COMMENT 'カテゴリ（食べ物 / 動詞 等）',
+  is_daily   TINYINT(1)   NOT NULL DEFAULT 0          COMMENT '日常カードフラグ',
+  created_by CHAR(36)                                 COMMENT 'NULL はシステム共有カード',
+  created_at DATETIME     NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id),
+  FOREIGN KEY fk_cards_user (created_by)
+    REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 日常カードのシード
-INSERT INTO cards (label, emoji, is_daily) VALUES
-  ('こんにちは', '👋', true),
-  ('ありがとう', '🙏', true),
-  ('すみません', '🙇', true),
-  ('はい',       '✅', true),
-  ('いいえ',     '❌', true);
+INSERT INTO cards (id, label, emoji, is_daily) VALUES
+  (UUID(), 'こんにちは', '👋', 1),
+  (UUID(), 'ありがとう', '🙏', 1),
+  (UUID(), 'すみません', '🙇', 1),
+  (UUID(), 'はい',       '✅', 1),
+  (UUID(), 'いいえ',     '❌', 1);
 ```
 
 #### ④ location_cards（共有ロケーション × カード）
 
 ```sql
 CREATE TABLE location_cards (
-  id          UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-  location_id UUID        NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
-  card_id     UUID        NOT NULL REFERENCES cards(id)     ON DELETE CASCADE,
-  sort_order  INTEGER     NOT NULL DEFAULT 0,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (location_id, card_id)
-);
+  id          CHAR(36) NOT NULL DEFAULT (UUID()),
+  location_id CHAR(36) NOT NULL COMMENT '共有ロケーションID',
+  card_id     CHAR(36) NOT NULL COMMENT 'カードID',
+  sort_order  INT      NOT NULL DEFAULT 0,
+  created_at  DATETIME NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_loc_card (location_id, card_id),
+  FOREIGN KEY fk_lc_location (location_id)
+    REFERENCES locations(id) ON DELETE CASCADE,
+  FOREIGN KEY fk_lc_card (card_id)
+    REFERENCES cards(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 #### ⑤ user_locations（ユーザー独自ロケーション）
 
 ```sql
 CREATE TABLE user_locations (
-  id         UUID             NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-  user_id    UUID             NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name       VARCHAR(100)     NOT NULL,       -- 例: ピアノ教室
-  latitude   DOUBLE PRECISION NOT NULL,
-  longitude  DOUBLE PRECISION NOT NULL,
-  radius_m   INTEGER          NOT NULL DEFAULT 100,
-  created_at TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ      NOT NULL DEFAULT NOW()
-);
+  id         CHAR(36)     NOT NULL DEFAULT (UUID()),
+  user_id    CHAR(36)     NOT NULL COMMENT '所有ユーザーID',
+  name       VARCHAR(100) NOT NULL COMMENT '場所名（例: ピアノ教室）',
+  latitude   DOUBLE       NOT NULL COMMENT '緯度',
+  longitude  DOUBLE       NOT NULL COMMENT '経度',
+  radius_m   INT          NOT NULL DEFAULT 100 COMMENT '判定半径（メートル）',
+  created_at DATETIME     NOT NULL DEFAULT NOW(),
+  updated_at DATETIME     NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id),
+  FOREIGN KEY fk_ul_user (user_id)
+    REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 #### ⑥ user_location_cards（ユーザーロケーション × カード）
 
 ```sql
 CREATE TABLE user_location_cards (
-  id               UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-  user_location_id UUID        NOT NULL REFERENCES user_locations(id) ON DELETE CASCADE,
-  card_id          UUID        NOT NULL REFERENCES cards(id)          ON DELETE CASCADE,
-  sort_order       INTEGER     NOT NULL DEFAULT 0,
-  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (user_location_id, card_id)
-);
+  id               CHAR(36) NOT NULL DEFAULT (UUID()),
+  user_location_id CHAR(36) NOT NULL COMMENT 'ユーザーロケーションID',
+  card_id          CHAR(36) NOT NULL COMMENT 'カードID',
+  sort_order       INT      NOT NULL DEFAULT 0,
+  created_at       DATETIME NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_ulc (user_location_id, card_id),
+  FOREIGN KEY fk_ulc_location (user_location_id)
+    REFERENCES user_locations(id) ON DELETE CASCADE,
+  FOREIGN KEY fk_ulc_card (card_id)
+    REFERENCES cards(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### 3.3 インデックス
 
 ```sql
 -- ロケーション距離判定（緯度経度での概算フィルタ）
-CREATE INDEX idx_locations_latlng         ON locations(latitude, longitude);
-CREATE INDEX idx_user_locations_user      ON user_locations(user_id);
-CREATE INDEX idx_user_locations_latlng    ON user_locations(latitude, longitude);
+CREATE INDEX idx_locations_latlng       ON locations(latitude, longitude);
+CREATE INDEX idx_user_locations_user    ON user_locations(user_id);
+CREATE INDEX idx_user_locations_latlng  ON user_locations(latitude, longitude);
 
 -- カード取得の高速化
-CREATE INDEX idx_location_cards_location  ON location_cards(location_id, sort_order);
-CREATE INDEX idx_user_location_cards_ul   ON user_location_cards(user_location_id, sort_order);
-CREATE INDEX idx_cards_is_daily           ON cards(is_daily);
-CREATE INDEX idx_cards_created_by         ON cards(created_by);
+CREATE INDEX idx_location_cards_loc     ON location_cards(location_id, sort_order);
+CREATE INDEX idx_ulc_ul                 ON user_location_cards(user_location_id, sort_order);
+CREATE INDEX idx_cards_is_daily         ON cards(is_daily);
+CREATE INDEX idx_cards_created_by       ON cards(created_by);
 ```
 
 ---
@@ -261,7 +302,7 @@ CREATE INDEX idx_cards_created_by         ON cards(created_by);
 |---|---|
 | Base URL | `/api/v1` |
 | 認証ヘッダー | `Authorization: Bearer <access_token>` |
-| Content-Type | `application/json`（画像アップロードのみ `multipart/form-data`） |
+| Content-Type | `application/json`（カード作成のみ `multipart/form-data`） |
 | エラー形式 | `{ "error": "メッセージ", "code": "ERROR_CODE" }` |
 | ゲスト可 | 表中「不要」のエンドポイントは未認証で呼び出し可能 |
 
@@ -290,14 +331,14 @@ CREATE INDEX idx_cards_created_by         ON cards(created_by);
 
 | メソッド | パス | 認証 | 説明 |
 |---|---|---|---|
-| GET    | `/locations/nearby`           | 不要 | 現在地(lat,lng)から半径内のロケーションを距離順で返す |
-| GET    | `/locations`                  | 不要 | 共有ロケーション一覧（デフォルトボード） |
-| GET    | `/locations/:id/cards`        | 不要 | 共有ロケーションのカード一覧 |
-| GET    | `/user/locations`             | 必要 | ユーザー独自ロケーション一覧 |
-| POST   | `/user/locations`             | 必要 | 独自ロケーション追加 |
-| PUT    | `/user/locations/:id`         | 必要 | 独自ロケーション更新 |
-| DELETE | `/user/locations/:id`         | 必要 | 独自ロケーション削除 |
-| GET    | `/user/locations/:id/cards`   | 必要 | ユーザーロケーションのカード一覧 |
+| GET    | `/locations/nearby`         | 不要 | 現在地(lat,lng)から半径内のロケーションを距離順で返す |
+| GET    | `/locations`                | 不要 | 共有ロケーション一覧 |
+| GET    | `/locations/:id/cards`      | 不要 | 共有ロケーションのカード一覧 |
+| GET    | `/user/locations`           | 必要 | ユーザー独自ロケーション一覧 |
+| POST   | `/user/locations`           | 必要 | 独自ロケーション追加 |
+| PUT    | `/user/locations/:id`       | 必要 | 独自ロケーション更新 |
+| DELETE | `/user/locations/:id`       | 必要 | 独自ロケーション削除 |
+| GET    | `/user/locations/:id/cards` | 必要 | ユーザーロケーションのカード一覧 |
 
 **GET /locations/nearby クエリパラメータ例**
 
@@ -308,7 +349,7 @@ GET /api/v1/locations/nearby?lat=33.2500&lng=131.6100&radius_m=500
 ```json
 [
   {
-    "id":          "uuid-xxxx",
+    "id":          "char36-uuid",
     "name":        "コンビニ",
     "type":        "shared",
     "distance_m":  42,
@@ -319,54 +360,59 @@ GET /api/v1/locations/nearby?lat=33.2500&lng=131.6100&radius_m=500
 
 > **Haversine 公式について**
 > Haversine 公式とは、球面上の 2 地点間の距離を緯度・経度から計算する公式。
-> `GET /locations/nearby` のバックエンド実装では、まず DB クエリで
-> `±0.01度` の概算範囲フィルタをかけて候補を絞り込み、
-> 取得した候補に対して Go のサービス層で Haversine 公式による正確な距離計算を行い、
+> `GET /locations/nearby` では DB クエリで `±0.01度` の概算範囲フィルタをかけて候補を絞り込み、
+> Go のサービス層で Haversine 公式による正確な距離計算を行い、
 > `radius_m` 以内のロケーションのみ距離昇順で返す。
 
 ### 4.4 カード API（`/api/v1/cards`）
 
 | メソッド | パス | 認証 | 説明 |
 |---|---|---|---|
-| GET    | `/cards/daily`                              | 不要 | 日常カード一覧（is_daily=true） |
-| POST   | `/user/cards`                               | 必要 | ユーザー独自カード作成 |
-| POST   | `/user/locations/:id/cards`                 | 必要 | ロケーションにカードを追加（共有カードも可） |
-| DELETE | `/user/locations/:id/cards/:card_id`        | 必要 | ロケーションからカードを削除 |
-| PUT    | `/user/locations/:id/cards/reorder`         | 必要 | カード表示順の一括更新 |
+| GET    | `/cards/daily`                       | 不要 | 日常カード一覧（is_daily=1） |
+| POST   | `/user/cards`                        | 必要 | カード作成（画像アップロード＋DB保存を1リクエストで完結） |
+| POST   | `/user/locations/:id/cards`          | 必要 | ロケーションにカードを追加（共有カードも可） |
+| DELETE | `/user/locations/:id/cards/:card_id` | 必要 | ロケーションからカードを削除 |
+| PUT    | `/user/locations/:id/cards/reorder`  | 必要 | カード表示順の一括更新 |
 
-### 4.5 画像アップロード API
-
-| メソッド | パス | 認証 | 説明 |
-|---|---|---|---|
-| POST | `/upload/image` | 必要 | 画像アップロード（multipart/form-data）→ 保存先 URL を返す |
-
-> **Phase 1 / Phase 2 の動作**
-> - Phase 1: Go サーバーが `/uploads/` に保存し `/uploads/{key}` で配信
-> - Phase 2: `storage.ImageStorage` の実装が Supabase Storage に切り替わり公開 URL を返す
-> - API のインターフェースは両 Phase で変わらない
-
-**リクエスト / レスポンス例**
+**POST /user/cards（案A・画像＋DB保存を1リクエスト）**
 
 ```
-POST /api/v1/upload/image
+POST /api/v1/user/cards
 Content-Type: multipart/form-data
-Body: file=<image binary>
+
+フィールド:
+  file:     <画像バイナリ>（任意）
+  label:    "おにぎり"
+  emoji:    "🍙"（file がない場合に使用）
+  category: "食べ物"
+```
+
+```
+Go 内部処理:
+  1. file を取り出し Supabase Storage にアップロード
+  2. 公開 URL を取得
+  3. cards テーブルに INSERT（image_url に URL を保存）
+  4. 作成したカード情報をレスポンスで返す
 ```
 
 ```json
+// レスポンス
 {
-  "url": "https://xxxx.supabase.co/storage/v1/object/public/cards/uuid.jpg",
-  "key": "cards/uuid.jpg"
+  "id":        "char36-uuid",
+  "label":     "おにぎり",
+  "image_url": "https://xxxx.supabase.co/storage/v1/object/public/cards/uuid.jpg",
+  "emoji":     null,
+  "category":  "食べ物",
+  "is_daily":  false,
+  "created_at": "2025-01-01T00:00:00Z"
 }
 ```
 
-### 4.6 AI レコメンド API
+### 4.5 AI レコメンド API
 
 | メソッド | パス | 認証 | 説明 |
 |---|---|---|---|
 | POST | `/ai/recommend` | 不要 | 選択単語配列 → 自然な文章候補を返す（Gemini 2.5 Flash） |
-
-**リクエスト / レスポンス例**
 
 ```json
 // Request
@@ -387,7 +433,7 @@ Body: file=<image binary>
 
 > **レイテンシ対策**
 > フロントエンドはカード選択後 500ms のデバウンスを経てリクエスト送信。
-> AI 生成中も元の単語列をそのまま発音ボタンで発話できる設計を維持し、ユーザーを待たせない。
+> AI 生成中も元の単語列をそのまま発音ボタンで発話できる設計を維持する。
 
 ---
 
@@ -406,14 +452,13 @@ tsu_hackB/
 │   │   └── config.go                 # 環境変数読み込み（godotenv）
 │   │
 │   ├── db/
-│   │   └── db.go                     # PostgreSQL 接続（pgx/v5）
+│   │   └── db.go                     # MySQL 接続（go-sql-driver/mysql）
 │   │
 │   ├── handler/                      # Gin ハンドラ層（薄く保つ）
 │   │   ├── auth.go                   # POST /auth/*
 │   │   ├── location.go               # GET /locations/*
 │   │   ├── card.go                   # GET,POST /cards/*
 │   │   ├── user_location.go          # CRUD /user/locations/*
-│   │   ├── upload.go                 # POST /upload/image
 │   │   └── ai.go                     # POST /ai/recommend
 │   │
 │   ├── middleware/
@@ -423,13 +468,14 @@ tsu_hackB/
 │   ├── service/                      # ビジネスロジック層
 │   │   ├── auth_service.go           # JWT 発行・検証・bcrypt
 │   │   ├── location_service.go       # Haversine 距離計算
-│   │   ├── card_service.go           # カード CRUD
+│   │   ├── card_service.go           # カード CRUD・画像アップロード呼び出し
 │   │   └── ai_service.go             # Gemini 2.5 Flash API 呼び出し
 │   │
 │   ├── storage/
 │   │   ├── storage.go                # ImageStorage インターフェース定義
-│   │   ├── local.go                  # LocalStorage（Phase 1）
-│   │   └── supabase.go               # SupabaseStorage（Phase 2）
+│   │   └── supabase.go               # SupabaseStorage 実装
+│   │                                 # Upload() → Supabase Storage に保存 → 公開URL返却
+│   │                                 # 返却した URL を card_service が cards.image_url に保存
 │   │
 │   ├── model/                        # DB モデル・リクエスト/レスポンス型
 │   │   ├── user.go
@@ -440,7 +486,7 @@ tsu_hackB/
 │   └── router/
 │       └── router.go                 # Gin ルーティング定義
 │
-├── migrations/                       # SQL マイグレーションファイル
+├── migrations/                       # MySQL マイグレーション SQL
 │   ├── 001_create_users.sql
 │   ├── 002_create_locations.sql
 │   ├── 003_create_cards.sql
@@ -449,13 +495,8 @@ tsu_hackB/
 │   ├── 006_create_user_location_cards.sql
 │   └── 007_seed_initial_data.sql     # コンビニ/病院/カフェ + 日常カード
 │
-├── supabase/                         # Supabase CLI 管理（tsu_hackB に集約）
-│   ├── config.toml
-│   ├── migrations/                   # Supabase 用マイグレーション
-│   └── seed.sql
-│
 ├── Dockerfile
-├── docker-compose.yml                # PostgreSQL + Go + Mailpit（ローカル開発用）
+├── docker-compose.yml                # MySQL + Go + Mailpit（ローカル開発用）
 ├── go.mod
 ├── go.sum
 └── .env.example
@@ -467,7 +508,7 @@ tsu_hackB/
 tsu_hackF/
 ├── src/
 │   ├── app/                              # App Router
-│   │   ├── layout.tsx                    # ルートレイアウト
+│   │   ├── layout.tsx
 │   │   ├── page.tsx                      # ホーム画面（GPS 取得・ボード選択）
 │   │   ├── board/
 │   │   │   └── [locationId]/
@@ -481,8 +522,8 @@ tsu_hackF/
 │   │
 │   ├── components/
 │   │   ├── board/
-│   │   │   ├── CardGrid.tsx              # カードグリッド（大ボタン）
-│   │   │   ├── CardItem.tsx              # 単一カード
+│   │   │   ├── CardGrid.tsx
+│   │   │   ├── CardItem.tsx
 │   │   │   ├── SelectedList.tsx          # 選択リスト（ストック箱）
 │   │   │   ├── AiSuggestion.tsx          # AI レコメンド表示領域
 │   │   │   └── SpeakButton.tsx           # 発音ボタン（Web Speech API）
@@ -491,8 +532,8 @@ tsu_hackF/
 │   │   │   └── LocationChanger.tsx       # ロケーション変更ボタン
 │   │   ├── edit/
 │   │   │   ├── CardEditor.tsx            # カード追加フォーム
-│   │   │   └── ImageUploader.tsx         # 画像アップロード
-│   │   └── ui/                           # 汎用 UI コンポーネント
+│   │   │   └── ImageUploader.tsx         # 画像選択・プレビュー・送信
+│   │   └── ui/
 │   │       ├── Button.tsx
 │   │       ├── LoadingSpinner.tsx
 │   │       └── Modal.tsx
@@ -506,18 +547,17 @@ tsu_hackF/
 │   ├── lib/
 │   │   ├── api.ts                        # API クライアント（fetch wrapper）
 │   │   ├── auth.ts                       # トークン管理（httpOnly Cookie）
-│   │   └── geo.ts                        # 距離計算ユーティリティ（クライアント側）
+│   │   └── geo.ts                        # 距離計算ユーティリティ
 │   │
 │   ├── store/
 │   │   └── boardStore.ts                 # Zustand: 選択カード・AI 候補状態
 │   │                                     # ※ "use client" コンポーネント内でのみ使用
-│   │
 │   └── types/
 │       ├── location.ts
 │       ├── card.ts
 │       └── auth.ts
 │
-├── public/icons/                         # デフォルト絵記号画像
+├── public/icons/
 ├── next.config.ts
 ├── tailwind.config.ts
 └── package.json
@@ -529,10 +569,8 @@ tsu_hackF/
 
 ### 6.1 起動方法
 
-Next.js はローカルで通常起動、PostgreSQL と Go は Docker で起動する。
-
 ```bash
-# 1. PostgreSQL + Go + Mailpit を Docker で起動（tsu_hackB 内）
+# 1. MySQL + Go + Mailpit を Docker で起動（tsu_hackB 内）
 docker compose up -d
 
 # 2. マイグレーション実行
@@ -544,21 +582,22 @@ npm run dev
 
 ### 6.2 docker-compose.yml（tsu_hackB）
 
-PostgreSQL・Go バックエンド・Mailpit の 3 サービスのみ含める。
-Next.js は含めない。
+Next.js は含めない。MySQL・Go・Mailpit の 3 サービスのみ。
 
 ```yaml
 services:
   db:
-    image: postgres:16-alpine
+    image: mysql:8.0
     ports:
-      - "5432:5432"
+      - "3306:3306"
     environment:
-      POSTGRES_DB: aac_dev
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      MYSQL_DATABASE: aac_dev
+      MYSQL_USER: aac
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: rootpassword
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mysqldata:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
 
   backend:
     build: .
@@ -567,8 +606,6 @@ services:
     env_file: .env
     depends_on:
       - db
-    volumes:
-      - ./uploads:/app/uploads    # 画像の永続化（Phase 1）
 
   mailpit:
     image: axllent/mailpit
@@ -577,22 +614,15 @@ services:
       - "1025:1025"   # SMTP（バックエンドからの送信先）
 
 volumes:
-  pgdata:
+  mysqldata:
 ```
 
 ### 6.3 Mailpit について
 
-Mailpit は Docker イメージ 1 行で起動できるローカル用メールキャッチャー。
-バックエンドのメール送信先 SMTP を `localhost:1025` に向けるだけで、
+Mailpit は追加設定不要のローカル用メールキャッチャー。
+バックエンドの SMTP 送信先を `localhost:1025` に向けるだけで、
 送信されたメールをブラウザ（`http://localhost:8025`）で確認できる。
-
-```
-# backend/.env の SMTP 設定（Phase 1 ローカル用）
-SMTP_HOST=localhost
-SMTP_PORT=1025
-```
-
-追加設定・アカウント登録は一切不要で、認証メールのテストに使える。
+アカウント登録・外部サービス契約は一切不要。
 
 ---
 
@@ -605,22 +635,17 @@ SMTP_PORT=1025
 PORT=8080
 ENV=development   # development | production
 
-# データベース
-# Phase 1: Docker PostgreSQL
-# Phase 2: Supabase 接続文字列に変更
-DATABASE_URL=postgres://postgres:password@localhost:5432/aac_dev
+# MySQL
+# Phase 1: Docker MySQL
+# Phase 2: Render MySQL 接続文字列に変更
+DATABASE_URL=aac:password@tcp(localhost:3306)/aac_dev?charset=utf8mb4&parseTime=True
 
 # JWT
 JWT_SECRET=your-secret-key-min-32chars
 JWT_ACCESS_EXPIRES_MIN=15
 JWT_REFRESH_EXPIRES_DAYS=7
 
-# 画像ストレージ切り替え
-STORAGE_BACKEND=local            # local | supabase
-UPLOAD_DIR=./uploads             # Phase 1: ローカルディスク保存先
-BASE_URL=http://localhost:8080   # Phase 1: 画像配信ベース URL
-
-# Supabase（Phase 2 で設定）
+# Supabase Storage（Phase 1・2 共通）
 SUPABASE_URL=https://xxxx.supabase.co
 SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 SUPABASE_STORAGE_BUCKET=cards
@@ -660,11 +685,11 @@ NEXT_PUBLIC_APP_URL=http://localhost:3000
 - Content-Type 検証（`image/jpeg` / `image/png` / `image/webp` のみ許可）
 - ファイルサイズ上限: 5MB
 - 保存時にファイル名を UUID にリネーム（パストラバーサル防止）
-- Phase 2: Supabase Storage の RLS（Row Level Security）でユーザーごとにアクセス制限
+- Supabase Storage のバケットポリシーで認証済みユーザーのみアップロード可能に設定
 
 ### 8.3 API 共通
 
 - 全エンドポイントに CORS 設定（許可オリジンを環境変数で管理）
 - Gin の Rate Limiting ミドルウェアで連続リクエスト制限
 - DB クエリはプリペアドステートメントのみ使用（SQL インジェクション防止）
-- `Authorization` ヘッダーは HTTPS 経由でのみ送信（Phase 2: Render + Vercel はデフォルト HTTPS）
+- HTTPS 経由のみで `Authorization` ヘッダーを送信（Phase 2: Render + Vercel はデフォルト HTTPS）
